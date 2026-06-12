@@ -91,3 +91,66 @@ class MMHalDataset(Dataset):
         image = self.trans(image)
 
         return {'question': question, 'image': image, 'image_path': img_src}
+
+
+class POPEChatCalibDataset(Dataset):
+    """
+    Calibration set derived from POPE chat JSONs.
+    Each example yields (image, query, label) where label is 1 if the
+    reference answer is 'no' (i.e., likely hallucination-prone query), else 0.
+    This binary label acts as a hallucination-likeness proxy for fitting
+    per-layer spectral thresholds.
+    """
+
+    def __init__(self, pope_path, data_path, trans, max_examples: int = 200, seed: int = 927):
+        self.trans = trans
+        self.data_path = data_path
+        random.seed(seed)
+
+        records = []
+        for q in open(pope_path, "r"):
+            line = json.loads(q)
+            for txt, lab in zip(line["text"], line["label"]):
+                records.append((line["image"], txt, 1 if lab == "no" else 0))
+        random.shuffle(records)
+        records = records[:max_examples]
+
+        self.records = records
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        img_name, query, label = self.records[index]
+        image_path = os.path.join(self.data_path, img_name)
+        raw_image = Image.open(image_path).convert("RGB")
+        image = self.trans(raw_image)
+        return {"image": image, "query": query, "label": label, "image_path": image_path}
+
+
+class COCOCalibDataset(Dataset):
+    """
+    Calibration set from COCO val. Each example yields (image, label=0).
+    These provide 'clean' reference points for the spectral feature
+    distribution; hallucination labels are then derived from the model's
+    own predictions on a held-out slice.
+    """
+
+    def __init__(self, data_path, trans, max_examples: int = 200, seed: int = 927):
+        self.trans = trans
+        self.data_path = data_path
+        random.seed(seed)
+        img_files = sorted(os.listdir(data_path))
+        random.shuffle(img_files)
+        self.img_files = img_files[:max_examples]
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, index):
+        img_file = self.img_files[index]
+        img_id = int(img_file.split(".jpg")[0][-6:])
+        img_path = os.path.join(self.data_path, img_file)
+        image = Image.open(img_path).convert("RGB")
+        image = self.trans(image)
+        return {"img_id": img_id, "image": image, "image_path": img_path, "label": 0}

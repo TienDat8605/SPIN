@@ -1,11 +1,13 @@
 import os
 import yaml
+import warnings
 from collections import namedtuple
 
 import torch
 
 from CFG import CFGLogits
 from constants import (
+    BACKBONE_WHITELIST,
     DEFAULT_IMAGE_PATCH_TOKEN,
     IMAGE_TOKEN_INDEX,
     IMAGE_TOKEN_LENGTH,
@@ -177,6 +179,17 @@ class ModelLoader:
         self.llm_model = None
         self.image_processor = None
         self.load_model()
+
+    def is_cb_spectral_compatible(self) -> bool:
+        return self.model_name in BACKBONE_WHITELIST
+
+    def warn_if_cb_incompatible(self) -> None:
+        if not self.is_cb_spectral_compatible():
+            warnings.warn(
+                f"CB-Spectral is only supported on {sorted(BACKBONE_WHITELIST)}; "
+                f"got '{self.model_name}'. Forcing spectral_mode='none' (legacy SPIN).",
+                stacklevel=2,
+            )
 
     def load_model(self):
         if self.model_name == "llava-1.5":

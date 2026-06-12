@@ -4,11 +4,14 @@ from tqdm import tqdm
 
 import torch
 
-from attentionSPIN import llama_modify_spin
+from attentionSPIN import llama_modify_spin, llama_modify_cb
 from constants import INSTRUCTION_TEMPLATE, SYSTEM_MESSAGE
 from llava.utils import disable_torch_init
 from model_loader import ModelLoader
 from eval_data_loader import MMHalDataset
+
+from calibrate_spectral import calibrate_spectral
+from spectral_config import SpectralConfig
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="MMHal evaluation on LVLMs.")
@@ -37,6 +40,15 @@ if __name__ == '__main__':
                         help="Set to 1.1 when using Minigpt4")
     # --------------------------------------------
 
+    # --------------- CB-Spectral -----------------
+    parser.add_argument("--use-cb", action="store_true", help="Use CB-Spectral head modulation")
+    parser.add_argument("--spectral-mode", type=str, default="fft", choices=["fft", "power", "block", "none"])
+    parser.add_argument("--suppression-coeff", type=float, default=0.3)
+    parser.add_argument("--reinforcement-coeff", type=float, default=0.15)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--n-calib-examples", type=int, default=64)
+    # --------------------------------------------
+
     args = parser.parse_args()
 
     assert args.batch_size == 1, f'Only tested on batch_size=1'
@@ -48,6 +60,46 @@ if __name__ == '__main__':
     disable_torch_init()
 
     model_loader = ModelLoader(args.model, args.llava_size)
+
+    if args.use_cb and not model_loader.is_cb_spectral_compatible():
+        model_loader.warn_if_cb_incompatible()
+        args.use_cb = False
+        args.spectral_mode = "none"
+
+    cb_thresholds = None
+    if args.use_cb and args.spectral_mode != "none":
+        spectral_cfg = SpectralConfig(
+            spectral_mode=args.spectral_mode,
+            suppression_coeff=args.suppression_coeff,
+            reinforcement_coeff=args.reinforcement_coeff,
+            temperature=args.temperature,
+            n_calib_examples=args.n_calib_examples,
+        )
+        from eval_data_loader import POPEChatCalibDataset
+        calib_dataset = POPEChatCalibDataset(
+            pope_path="./pope_coco/chat/coco_pope_chat_random.json",
+            data_path="./pope_coco/val2014/",
+            trans=model_loader.image_processor,
+            max_examples=args.n_calib_examples,
+        )
+        questions_dummy = ["Please describe the image in detail."]
+        image_dummy = next(iter(torch.utils.data.DataLoader(calib_dataset, batch_size=1)))[
+            "image"
+        ]
+        _, img_s, img_e, _ = model_loader.prepare_inputs_for_model(template, questions_dummy, image_dummy)
+        cb_thresholds = calibrate_spectral(
+            model=model_loader.llm_model,
+            dataset=calib_dataset,
+            template=template,
+            prepare_inputs_fn=model_loader.prepare_inputs_for_model,
+            spectral_cfg=spectral_cfg,
+            start_layer=args.start_layer,
+            end_layer=args.end_layer,
+            img_start_idx=img_s,
+            img_end_idx=img_e,
+            batch_size=1,
+        )
+        print(f"[mmhal_eval] Calibrated per-layer thresholds: {cb_thresholds}")
 
     mmhal_dataset = MMHalDataset(json_path=args.input, trans=model_loader.image_processor)
     mmhal_loader = torch.utils.data.DataLoader(
@@ -76,6 +128,39 @@ if __name__ == '__main__':
                 routed_head=args.routed_heads,
                 use_spin_img=True,
                 small_num_mask=args.small_num_mask,
+            )
+
+        elif args.use_cb:
+            spectral_cfg = SpectralConfig(
+                spectral_mode=args.spectral_mode,
+                suppression_coeff=args.suppression_coeff,
+                reinforcement_coeff=args.reinforcement_coeff,
+                temperature=args.temperature,
+                n_calib_examples=args.n_calib_examples,
+            )
+            n_gated = args.end_layer - args.start_layer
+            if cb_thresholds is not None:
+                tau_weak = torch.tensor(
+                    [cb_thresholds[l][0] for l in range(n_gated)],
+                    dtype=torch.float32,
+                )
+                tau_strong = torch.tensor(
+                    [cb_thresholds[l][1] for l in range(n_gated)],
+                    dtype=torch.float32,
+                )
+            else:
+                tau_weak = None
+                tau_strong = None
+            llama_modify_cb(
+                model_loader.llm_model,
+                args.start_layer,
+                args.end_layer,
+                model_loader.img_start_idx,
+                model_loader.img_end_idx,
+                spectral_cfg=spectral_cfg,
+                tau_weak=tau_weak,
+                tau_strong=tau_strong,
+                capture=False,
             )
         
         with torch.inference_mode():

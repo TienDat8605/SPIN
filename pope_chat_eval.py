@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from attentionPAI import llama_modify
-from attentionSPIN import llama_modify_spin
+from attentionSPIN import llama_modify_spin, llama_modify_cb
 
 from constants import (
     INSTRUCTION_TEMPLATE,
@@ -19,6 +19,9 @@ from model_loader import ModelLoader
 
 from CFG_damro import DamroCFGLogits
 from utils import setup_seeds, add_diffusion_noise
+
+from calibrate_spectral import calibrate_spectral
+from spectral_config import SpectralConfig
 
 from transformers.generation.logits_process import LogitsProcessorList
 
@@ -58,6 +61,15 @@ parser.add_argument("--small-num-mask", type=float, default=None,
                     help="The scaling factor for SPIN")
 parser.add_argument("--repetition-penalty", type=float, default=1.0,
                     help="Leave as default.")
+# --------------------------------------------
+
+# --------------- CB-Spectral -----------------
+parser.add_argument("--use-cb", action="store_true", help="Use CB-Spectral head modulation")
+parser.add_argument("--spectral-mode", type=str, default="fft", choices=["fft", "power", "block", "none"])
+parser.add_argument("--suppression-coeff", type=float, default=0.3)
+parser.add_argument("--reinforcement-coeff", type=float, default=0.15)
+parser.add_argument("--temperature", type=float, default=0.1)
+parser.add_argument("--n-calib-examples", type=int, default=64)
 # --------------------------------------------
 
 # ---------------- DAMRO ----------------
@@ -101,6 +113,46 @@ setup_seeds()
 disable_torch_init()
 
 model_loader = ModelLoader(args.model, args.llava_size)
+
+if args.use_cb and not model_loader.is_cb_spectral_compatible():
+    model_loader.warn_if_cb_incompatible()
+    args.use_cb = False
+    args.spectral_mode = "none"
+
+cb_thresholds = None
+if args.use_cb and args.spectral_mode != "none":
+    spectral_cfg = SpectralConfig(
+        spectral_mode=args.spectral_mode,
+        suppression_coeff=args.suppression_coeff,
+        reinforcement_coeff=args.reinforcement_coeff,
+        temperature=args.temperature,
+        n_calib_examples=args.n_calib_examples,
+    )
+    from eval_data_loader import POPEChatCalibDataset
+    calib_dataset = POPEChatCalibDataset(
+        pope_path=POPE_CHAT_PATH[args.calib_pope_type] if hasattr(args, "calib_pope_type") else POPE_CHAT_PATH[args.pope_type],
+        data_path=args.data_path,
+        trans=model_loader.image_processor,
+        max_examples=args.n_calib_examples,
+    )
+    questions_dummy = ["Please describe the image in detail."]
+    image_dummy = next(iter(torch.utils.data.DataLoader(calib_dataset, batch_size=1)))[
+        "image"
+    ]
+    _, img_s, img_e, _ = model_loader.prepare_inputs_for_model(template, questions_dummy, image_dummy)
+    cb_thresholds = calibrate_spectral(
+        model=model_loader.llm_model,
+        dataset=calib_dataset,
+        template=template,
+        prepare_inputs_fn=model_loader.prepare_inputs_for_model,
+        spectral_cfg=spectral_cfg,
+        start_layer=args.start_layer,
+        end_layer=args.end_layer,
+        img_start_idx=img_s,
+        img_end_idx=img_e,
+        batch_size=args.batch_size,
+    )
+    print(f"[pope_chat_eval] Calibrated per-layer thresholds: {cb_thresholds}")
 
 args.pope_path = POPE_CHAT_PATH[args.pope_type]
 pope_dataset = POPEChatDataSet(
@@ -208,6 +260,39 @@ for batch_id, data in tqdm(enumerate(pope_loader), total=len(pope_loader)):
                 routed_head=args.routed_heads,
                 use_spin_img=True,
                 small_num_mask=args.small_num_mask,
+            )
+
+        elif args.use_cb:
+            spectral_cfg = SpectralConfig(
+                spectral_mode=args.spectral_mode,
+                suppression_coeff=args.suppression_coeff,
+                reinforcement_coeff=args.reinforcement_coeff,
+                temperature=args.temperature,
+                n_calib_examples=args.n_calib_examples,
+            )
+            n_gated = args.end_layer - args.start_layer
+            if cb_thresholds is not None:
+                tau_weak = torch.tensor(
+                    [cb_thresholds[l][0] for l in range(n_gated)],
+                    dtype=torch.float32,
+                )
+                tau_strong = torch.tensor(
+                    [cb_thresholds[l][1] for l in range(n_gated)],
+                    dtype=torch.float32,
+                )
+            else:
+                tau_weak = None
+                tau_strong = None
+            llama_modify_cb(
+                model_loader.llm_model,
+                args.start_layer,
+                args.end_layer,
+                model_loader.img_start_idx,
+                model_loader.img_end_idx,
+                spectral_cfg=spectral_cfg,
+                tau_weak=tau_weak,
+                tau_strong=tau_strong,
+                capture=False,
             )
         
         elif args.use_damro:

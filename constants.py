@@ -6,6 +6,10 @@ SHIKRA_IMAGE_TOKEN_LENGTH = 256
 SHIKRA_IMG_START_TOKEN = 32001
 SHIKRA_IMG_END_TOKEN = 32002
 
+BACKBONE_WHITELIST = frozenset({"llava-1.5", "qwen-vl"})
+BACKBONE_LLAVA_KEY = "llava-1.5"
+BACKBONE_QWEN_KEY = "qwen-vl"
+
 INSTRUCTION_TEMPLATE = {
     "minigpt4": "###Human: <Img><ImageHere></Img> <question> ###Assistant:",
     "instructblip": "<ImageHere><question>",
